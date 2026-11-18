@@ -13,6 +13,7 @@ import { GUTTER, columnWidth, rowHeight } from "./estimate.js";
 import { ROW_PAD_Y, BUBBLE_PAD_X, BUBBLE_PAD_Y, BUBBLE_GAP, IMAGES_FS, bubbleWidth, bubbleTextWidth, CHIP_H, CHIP_PAD_Y, CHIP_GAP, OPEN_INDENT,
   CALL_H, SEP_H, FOOTER_H, STATUS_H, CARD_ROW_H, OTHER_H } from "./metrics.js";
 import { Composer } from "./composer.js";
+import { ChatStatus } from "./chatstatus.js";
 import { markdownView, codeBlockAt } from "./mdblocks.js";
 import { textScale } from "./config.js";
 
@@ -78,6 +79,7 @@ export class ChatView {
     this.busy = false;
     this.lastPoll = 0;
     this.composer = new Composer(cx);
+    this.chatStatus = new ChatStatus();
     this.composer.seen = (address) => { const f = this.feeds.get(address); return f ? { agent: f.agent ?? null, path: f.path ?? null } : null; };
     this.top = {}; startTop(cx, this.top);
     this.appear = new Appear();
@@ -112,6 +114,7 @@ export class ChatView {
     if (this.helper.changed()) cx.notify();
     cx.spawn((cx) => this.composer.pollStatus(cx));
     const agent = currentAgent();
+    this.chatStatus.tick(cx, agent, this.feed());
     cx.spawn((cx) => this.cards.poll(cx, this.address, wanted(agent, this.feed()?.rows)));
     if (this.wantOlder) { this.wantOlder = false; cx.spawn((cx) => this.loadOlder(cx)); }
     if (Date.now() - this.lastPoll >= POLL_MS) return this.poll(cx);
@@ -381,6 +384,7 @@ export class ChatView {
         if (card) el.child(this.appear.wrap(h_flex().w_full().px(16).pt(8).justify_center().on_mouse_down("left", stop).child(card), "chat-card-in", `${this.address}:${this.cards.key?.(this.address) ?? ""}`, cx, 10));
         return el.child(div().w_full().on_mouse_down("left", stop).child(this.composer.render(currentAgent(), t)));
       })
+      .child(this.chatStatus.render(currentAgent(), f, t))
       .child(overBar(t));
   }
 }

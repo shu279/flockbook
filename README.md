@@ -1,5 +1,7 @@
 # Flockbook
 
+This personal fork adds an always-visible Antigravity status bar below the Herdr Chat composer, including cumulative usage and active turn time over Herdr's existing remote connection. See [installation, rollback and limitations](herdr-app/docs/antigravity-status.md). The original layout remains available.
+
 > **Unofficial.** Flockbook is not affiliated with, endorsed by, or supported by Herdr, Inc. It uses only Herdr's public APIs.
 
 Flockbook is a reading view for your [Herdr](https://herdr.dev) coding agents. Read what each agent did, see which one needs you, and reply in one place.
