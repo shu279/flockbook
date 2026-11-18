@@ -120,7 +120,8 @@ export class ChatView {
     if (this.helper.changed()) cx.notify();
     cx.spawn((cx) => this.composer.pollStatus(cx));
     const agent = currentAgent();
-    this.chatStatus.tick(cx, agent, this.feed());
+    if (screen === "chat") this.chatStatus.tick(cx, agent, this.feed());
+    else this.chatStatus.select(null);
     this.chatQueue.tick(cx, agent, this.feed());
     cx.spawn((cx) => this.cards.poll(cx, this.address, wanted(agent, this.feed()?.rows)));
     if (this.wantOlder) { this.wantOlder = false; cx.spawn((cx) => this.loadOlder(cx)); }
@@ -387,6 +388,8 @@ export class ChatView {
       .when(Boolean(this.helper.removeCard(t, this.refresh)), (el) => el.child(h_flex().w_full().px(16).pt(8).justify_center()
         .on_mouse_down("left", stop).child(this.helper.removeCard(t, this.refresh))))
       .when(Boolean(f) && f.error?.code !== "not-agent" && !isRemoteProblem(f.error), (el) => {
+        const subagents = this.chatStatus.subagentsView(currentAgent(), f, t);
+        if (subagents) el.child(subagents);
         const queued = this.chatQueue.render(currentAgent(), f, t);
         if (queued) el.child(queued);
         const card = this.cards.view(this.address, t, "chat-card");

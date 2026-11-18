@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from statusline_usage import usage
+from statusline_usage import usage, usage_fingerprint
 
 
 class UsageTests(unittest.TestCase):
@@ -29,6 +29,7 @@ class UsageTests(unittest.TestCase):
         self.write([self.row(), self.row(3, 3060, 179, 6801)])
         got, _ = usage(self.path)
         tree = got.pop("cost_usage")
+        self.assertEqual(got.pop("subagents")["items"], [])
         self.assertEqual((tree["conversations"], tree["missing_conversations"]), (1, 0))
         self.assertEqual(tree["input_tokens"], got["input_tokens"])
         self.assertEqual(got, dict(input_tokens=11915, output_tokens=312,
@@ -110,7 +111,7 @@ class UsageTests(unittest.TestCase):
             dict(model=None, requests=1, input_tokens=50, output_tokens=7, input_cached_tokens=3000),
         ])
         self.assertTrue(got["usage_complete"], "unknown model does not make the numeric usage unknown")
-        self.assertEqual(state["version"], 3)
+        self.assertEqual(state["version"], 4)
 
     def test_correction_moves_usage_between_models_and_cancellation_removes_it(self):
         self.write([self.row(model="gemini-4-carbon-high")])
@@ -130,7 +131,7 @@ class UsageTests(unittest.TestCase):
         old["version"] = 1
         old["rows"] = {"1": [99999, 99999, 99999]}
         got, new = usage(self.path, old)
-        self.assertEqual(new["version"], 3)
+        self.assertEqual(new["version"], 4)
         self.assertEqual(got["input_tokens"], 8855)
         self.assertEqual(got["usage_by_model"][0]["model"], "gemini-4-carbon-high")
 
@@ -367,7 +368,9 @@ class LinkedUsageTests(unittest.TestCase):
         self.write(self.CHILD, [self.planner(count=0)])
         with patch("statusline_usage.MAX_STATE_BYTES", 1):
             got, state = usage(self.path)
-        self.assertEqual(state, {"version": 0})
+        self.assertEqual(state["version"], 0)
+        self.assertNotIn("rows", state)
+        self.assertIn(self.CHILD, state["observed_files"])
         self.assertEqual(got["cost_usage"]["input_tokens"], 20)
         self.assertEqual(usage(self.path, state)[0]["cost_usage"]["input_tokens"], 20)
 
@@ -386,6 +389,78 @@ class LinkedUsageTests(unittest.TestCase):
             self.assertEqual(sum(b["input_tokens"] for b in item["usage_by_model"]), item["input_tokens"])
         self.assertEqual(got["cost_usage"]["input_tokens"], 530)
         self.assertLess(len(json.dumps(got)), 256 * 1024)
+
+    def test_subagent_creation_is_visible_before_the_log_exists_and_roles_are_not_guessed(self):
+        launch = self.planner()
+        launch["tool_calls"][0]["args"] = {"Role": "Synthetic reviewer", "Prompt": "PRIVATE PROMPT"}
+        self.write(self.ROOT, [launch, self.creation()])
+        got, state = usage(self.path)
+        agents = got["subagents"]
+        self.assertEqual((agents["parent_id"], agents["missing"], agents["complete"]), (self.ROOT, 1, False))
+        self.assertEqual(agents["items"], [dict(id=self.CHILD, parent_id=self.ROOT, name="Synthetic reviewer",
+                         state="unknown", state_current=False, summary=None, updated_at=None)])
+        self.assertNotIn("PRIVATE PROMPT", json.dumps([got, state]))
+        self.write(self.ROOT, [self.planner(count=2), self.creation(), self.creation(self.OTHER, 3)])
+        agents = usage(self.path)[0]["subagents"]
+        self.assertTrue(all(item["name"].startswith("Subagent ") for item in agents["items"]))
+
+    def test_child_response_is_a_bounded_preview_not_proof_of_completion(self):
+        self.write(self.ROOT, [self.planner(), self.creation()])
+        response = {**self.planner(count=0), "content": "Visible synthetic response " + "界" * 500,
+                    "thinking": "PRIVATE THINKING", "created_at": "2026-01-01T12:00:00Z"}
+        self.write(self.CHILD, [response])
+        got, state = usage(self.path)
+        item = got["subagents"]["items"][0]
+        self.assertEqual((item["state"], item["state_current"]), ("responded", False))
+        self.assertEqual(item["updated_at"], response["created_at"])
+        self.assertLessEqual(len(item["summary"]), 240)
+        self.assertLessEqual(len(item["summary"].encode()), 480)
+        self.assertNotIn("PRIVATE THINKING", json.dumps([got, state]))
+        self.write(self.CHILD, [{"type": "GENERIC", "source": "MODEL", "status": "DONE", "step_index": 2,
+                                "content": "PRIVATE TOOL OUTPUT", "created_at": "2026-01-01T12:01:00Z"}], "a")
+        got, state = usage(self.path, state)
+        item = got["subagents"]["items"][0]
+        self.assertEqual(item["state"], "unknown", "DONE is only the tool record status")
+        self.assertIsNone(item["summary"])
+        self.assertNotIn("PRIVATE TOOL OUTPUT", json.dumps([got, state]))
+
+    def test_manager_state_is_uuid_bound_and_newer_child_response_wins(self):
+        def manager(child, role, state="running"):
+            return {"role": role, "type": "self", "conversationId": child,
+                    "transcript": self.log(child).with_name("transcript.jsonl").as_uri(),
+                    "state": state, "lastStepTime": "2026-01-01T12:00:00Z"}
+        rows = [self.planner(count=2), self.creation(), self.creation(self.OTHER, 3),
+                {**self.planner(step=4, count=0), "tool_calls": [{"name": "manage_subagents", "args": {}}]},
+                {"type": "GENERIC", "source": "MODEL", "status": "DONE", "step_index": 5,
+                 "content": "Synthetic manager result:\n" + json.dumps([
+                     manager(self.OTHER, "Second reviewer", "idle"), manager(self.CHILD, "First reviewer")])}]
+        self.write(self.ROOT, rows)
+        self.write(self.CHILD, [{**self.planner(count=0), "content": "Earlier response",
+                                "created_at": "2026-01-01T11:00:00Z"}])
+        self.write(self.OTHER, [])
+        got, state = usage(self.path)
+        first, second = got["subagents"]["items"]
+        self.assertEqual((first["id"], first["name"], first["state"]), (self.CHILD, "First reviewer", "working"))
+        self.assertEqual((second["id"], second["name"], second["state"]), (self.OTHER, "Second reviewer", "waiting"))
+        self.write(self.CHILD, [{**self.planner(step=2, count=0), "content": "Later response",
+                                "created_at": "2026-01-01T13:00:00Z"}], "a")
+        first = usage(self.path, state)[0]["subagents"]["items"][0]
+        self.assertEqual((first["state"], first["summary"]), ("responded", "Later response"))
+        # Identical text outside the corresponding tool block is not metadata.
+        rows[3]["tool_calls"] = []
+        self.write(self.ROOT, rows)
+        self.assertTrue(usage(self.path)[0]["subagents"]["items"][0]["name"].startswith("Subagent "))
+
+    def test_pruned_incremental_cache_keeps_observed_fingerprints_for_append_races(self):
+        self.write(self.ROOT, [self.planner(), self.creation()])
+        self.write(self.CHILD, [self.planner(count=0)])
+        with patch("statusline_usage.MAX_STATE_BYTES", 1):
+            _, state = usage(self.path)
+        before = state["observed_files"][self.CHILD]
+        self.write(self.CHILD, [self.planner(step=2, count=0)], "a")
+        after = usage_fingerprint(self.path, state["watched_children"])[self.CHILD]
+        self.assertNotEqual(before, after)
+        self.assertEqual(state["version"], 0)
 
 
 if __name__ == "__main__":

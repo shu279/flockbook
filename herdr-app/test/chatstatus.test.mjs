@@ -1,6 +1,6 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { ChatStatus, statusIdentity, parseStatus, formatTokens, formatCost } from "../mods/flockbook/chatstatus.js";
+import { ChatStatus, statusIdentity, parseStatus, formatTokens, formatCost, ACTIVE_POLL_MS, IDLE_POLL_MS } from "../mods/flockbook/chatstatus.js";
 import { ChatView } from "../mods/flockbook/chat.js";
 import { fake, reset, theme } from "./stub/herdr.mjs";
 import { textOf, byId } from "./stub/ui.mjs";
@@ -125,9 +125,9 @@ test("idle, approval and disconnection stop interpolation; resumed old snapshots
   bar.tick(cx, a(), feed()); await cx.settle();
   assert.match(bar.text(a(), feed()), /Turn: 44s/, "a second turn cannot resume the first turn's duration");
   fake.exec = () => reply(snapshot({ observed_at_ms: 9001000, turn: { id: "turn-2", elapsed_ms: 1000, running: true, complete: true } }));
-  clock = 8000; bar.tick(cx, a(), feed()); await cx.settle();
+  clock = 9000; bar.tick(cx, a(), feed()); await cx.settle();
   assert.match(bar.text(a(), feed()), /Turn: 1s/);
-  clock = 10000; fake.machines = [{ name: "cloud", layout: "unavailable" }];
+  clock = 11000; fake.machines = [{ name: "cloud", layout: "unavailable" }];
   bar.tick(cx, a(), feed());
   clock = 25000;
   assert.match(bar.text(a(), feed()), /Turn: 3s.*更新待ち/);
@@ -140,6 +140,7 @@ test("completion snapshot fixes the final duration and never includes later idle
   clock = 2000;
   fake.exec = () => reply(snapshot({ observed_at_ms: 9002000, state: "idle", turn: { id: "turn-1", elapsed_ms: 43321, running: false, complete: true } }));
   bar.tick(cx, a("cloud/t1", "idle"), feed()); await cx.settle();
+  clock = 3000; bar.tick(cx, a("cloud/t1", "idle"), feed()); await cx.settle();
   clock = 1000000;
   assert.match(bar.text(a("cloud/t1", "idle"), feed()), /Turn: 43s$/);
 });
@@ -155,13 +156,49 @@ test("failures preserve the last values as stale and freeze the clock", async ()
   let clock = 0; fake.exec = () => reply(snapshot());
   const bar = new ChatStatus(() => clock), cx = fakeCx();
   bar.tick(cx, a(), feed()); await cx.settle();
-  clock = 2000; fake.exec = () => { throw new Error("connection closed"); };
+  clock = ACTIVE_POLL_MS; fake.exec = () => { throw new Error("connection closed"); };
   bar.tick(cx, a(), feed()); await cx.settle();
-  clock = 8000;
-  assert.match(bar.text(a(), feed()), /In: 169,032.*Turn: 44s.*更新待ち/);
+  clock = ACTIVE_POLL_MS + 8000;
+  assert.match(bar.text(a(), feed()), /In: 169,032.*Turn: 57s.*更新待ち/);
   fake.exec = () => reply("{malformed");
   bar.tick(cx, a(), feed()); await cx.settle();
-  assert.match(bar.text(a(), feed()), /Turn: 44s.*更新待ち/);
+  assert.match(bar.text(a(), feed()), /Turn: 57s.*更新待ち/);
+});
+
+test("unchanged chats avoid one-second remote reads while the turn clock advances locally", async () => {
+  let clock = 0, reads = 0;
+  fake.exec = () => { reads++; return reply(snapshot()); };
+  const bar = new ChatStatus(() => clock), cx = fakeCx();
+  const f = { ...feed(), rows: [] };
+  for (clock = 0; clock < ACTIVE_POLL_MS; clock += 400) {
+    f.cursor = String(clock); // unrelated tool/log cursor updates are not cost events
+    bar.tick(cx, a(), f); await cx.settle();
+  }
+  assert.equal(reads, 1);
+  assert.match(bar.text(a(), f), /Turn: 57s$/);
+  bar.tick(cx, a(), f); await cx.settle();
+  assert.equal(reads, 2);
+  const idle = new ChatStatus(() => clock);
+  reads = 0; clock = 0;
+  for (; clock < IDLE_POLL_MS; clock += 400) { idle.tick(cx, a("cloud/t1", "idle"), f); await cx.settle(); }
+  assert.equal(reads, 1);
+  idle.tick(cx, a("cloud/t1", "idle"), f); await cx.settle();
+  assert.equal(reads, 2);
+});
+
+test("answers trigger a bounded refresh and one settling read for the final log flush", async () => {
+  let clock = 0, reads = 0, input = 10;
+  fake.exec = () => { reads++; return reply(snapshot({ input_tokens: input, sampled_at_ms: 9000500 + clock })); };
+  const bar = new ChatStatus(() => clock), cx = fakeCx(), f = { ...feed(), rows: [] };
+  bar.tick(cx, a(), f); await cx.settle();
+  clock = 4000; f.rows = [{ id: "answer", k: "assistant", text: "Answer ready" }];
+  bar.tick(cx, a(), f); await cx.settle();
+  assert.equal(reads, 2);
+  clock = 5000; input = 100;
+  bar.tick(cx, a(), f); await cx.settle(); assert.equal(reads, 2);
+  clock = 7000; bar.tick(cx, a(), f); await cx.settle();
+  assert.equal(reads, 3); assert.match(bar.text(a(), f), /In: 100/);
+  clock = 10000; bar.tick(cx, a(), f); await cx.settle(); assert.equal(reads, 3);
 });
 
 test("late reads never leak across agents, machines or a new session; only one read runs", async () => {
@@ -228,4 +265,28 @@ test("tree cost keeps parent token counters and follows the selected session", a
   assert.match(bar.text(a(), feed()), /In: 1,000,000.*API換算: 約¥1,912 │/);
   assert.equal(bar.entries.get(statusIdentity(a(), feed()).key).snapshot.cost_usage.conversations, 3);
   assert.match(bar.text(a("cloud/t2"), feed("cloud/t2")), /API換算: N\/A/);
+});
+
+test("child reports are bound to the selected session and do not force active polling from historical states", async () => {
+  const root = "00000000-0000-4000-8000-000000000001", child = "00000000-0000-4000-8000-000000000002";
+  const currentPath = path.replace("session-a", root), f = feed("cloud/t1", currentPath);
+  let clock = 0, reads = 0;
+  fake.exec = () => { reads++; return reply(snapshot({ session_id: root, transcript_path: currentPath,
+    subagents: { parent_id: root, complete: true, missing: 0, items: [
+      { id: child, parent_id: root, name: "Synthetic researcher", state: "working", state_current: true,
+        summary: "Synthetic visible response", updated_at: "2026-11-18T00:00:00Z" },
+    ] } })); };
+  const bar = new ChatStatus(() => clock), cx = fakeCx(), idle = a("cloud/t1", "idle");
+  bar.tick(cx, idle, f); await cx.settle();
+  let panel = bar.subagentsView(idle, f, theme());
+  assert.match(textOf(panel), /Synthetic researcher.*最終記録: 作業中/);
+  clock = ACTIVE_POLL_MS; bar.tick(cx, idle, f); await cx.settle();
+  assert.equal(reads, 1, "historical working is not a live child activity signal");
+  byId(panel, `subagent-${child}`)._h.on_click({}, cx);
+  bar.tick(cx, idle, f); await cx.settle();
+  assert.equal(reads, 2, "explicitly inspecting child details enables the shorter fallback");
+  panel = bar.subagentsView(idle, f, theme());
+  assert.match(textOf(panel), /直近の応答/);
+  assert.equal(bar.subagentsView(a("cloud/t2"), feed("cloud/t2", currentPath), theme()), null);
+  assert.equal(bar.subagents.open, null);
 });

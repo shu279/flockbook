@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import statusline_bridge as bridge
 
@@ -58,8 +59,14 @@ class BridgeTests(unittest.TestCase):
         buckets = [{"model": f"unknown-{i}-" + "x" * 140, "input_tokens": 1,
                     "output_tokens": 1, "input_cached_tokens": 1, "requests": 1} for i in range(256)]
         value = {"usage_by_model": buckets, "cost_usage": {"usage_by_model": buckets}}
-        path.write_text(json.dumps(value, separators=(",", ":")))
+        value["subagents"] = {"parent_id": "00000000-0000-4000-8000-000000000001", "complete": False,
+                              "missing": 1, "items": [dict(id=f"00000000-0000-4000-8000-{i:012d}",
+                                  parent_id="00000000-0000-4000-8000-000000000001", name="界" * 53,
+                                  summary="界" * 160, state="responded", state_current=False,
+                                  updated_at="2026-01-01T12:00:00.123456789+00:00") for i in range(64)]}
+        path.write_text(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
         self.assertGreater(path.stat().st_size, 32768)
+        self.assertLess(path.stat().st_size, 256 * 1024)
         self.assertEqual(bridge.read_snapshot(path), value)
         limit = 256 * 1024
         overhead = len(json.dumps({"padding": ""}, separators=(",", ":")).encode("utf-8"))
@@ -146,6 +153,82 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(sample["input_tokens"], 169052)
         self.assertEqual(sample["output_tokens"], 208385)
         self.assertEqual(sample["input_cached_tokens"], 40)
+
+    def test_unchanged_usage_skips_transcripts_and_large_incremental_cache(self):
+        with patch.object(bridge, "transcript_usage", wraps=bridge.transcript_usage) as scan:
+            self.update(1, "idle")
+            self.update(2, "working")
+            self.update(3, "working")
+            for seconds in (4, 10, 60, 120):
+                self.assertEqual(self.read(seconds)["input_tokens"], 169032)
+            self.assertEqual(scan.call_count, 1)
+        clock = bridge.private_path(self.state, "t1", "100:123")
+        self.assertNotIn("_usage", json.loads(clock.read_text()))
+        self.assertLess(clock.stat().st_size, 4096)
+        rows = clock.with_suffix(".usage-state.json")
+        with patch.object(bridge, "read_snapshot", wraps=bridge.read_snapshot) as read:
+            self.read(121)
+            self.assertNotIn(rows, [args.args[0] for args in read.call_args_list])
+
+    def test_callback_throttle_explicit_read_refresh_and_persist_without_clock_change(self):
+        self.update(1, "working")
+        clock = bridge.private_path(self.state, "t1", "100:123")
+        with self.transcript.open("a") as stream:
+            stream.write(json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2,
+                                    "input_tokens": 10, "output_tokens": 20}) + "\n")
+        with patch.object(bridge, "transcript_usage", wraps=bridge.transcript_usage) as scan:
+            self.assertEqual(self.update(2, "working")["input_tokens"], 169032)
+            before = clock.read_bytes()
+            self.assertEqual(self.read(3)["input_tokens"], 169042)
+            self.assertEqual(clock.read_bytes(), before, "reader never rewrites the producer Turn state")
+            self.assertEqual(self.read(4)["input_tokens"], 169042)
+            self.assertEqual(self.update(5, "idle")["input_tokens"], 169042)
+            self.assertEqual(scan.call_count, 1, "the new tail is parsed and persisted exactly once")
+        self.assertEqual(clock.with_suffix(".usage.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(clock.with_suffix(".usage-state.json").stat().st_mode & 0o777, 0o600)
+
+    def test_idle_parent_detects_missing_child_creation_and_child_only_response(self):
+        parent = "00000000-0000-4000-8000-000000000001"
+        child = "00000000-0000-4000-8000-000000000002"
+        brain = self.transcript.parents[3].resolve()
+        self.transcript = brain / parent / ".system_generated/logs/transcript_full.jsonl"
+        self.transcript.parent.mkdir(parents=True)
+        child_path = brain / child / ".system_generated/logs/transcript_full.jsonl"
+        self.payload.update(conversation_id=parent, session_id=parent, transcript_path=str(self.transcript))
+        rows = [{"type": "PLANNER_RESPONSE", "step_index": 1, "input_tokens": 10, "output_tokens": 20,
+                 "tool_calls": [{"name": "invoke_subagent", "args": {"Role": "Synthetic reviewer"}}]},
+                {"type": "GENERIC", "source": "MODEL", "status": "DONE", "step_index": 2,
+                 "content": json.dumps({"conversationId": child,
+                     "logAbsoluteUri": child_path.with_name("transcript.jsonl").as_uri(), "workspaceUris": []})}]
+        self.transcript.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        got = self.update(1, "idle")
+        self.assertEqual(got["cost_usage"]["missing_conversations"], 1)
+        self.assertEqual(got["subagents"]["items"][0]["id"], child)
+        child_path.parent.mkdir(parents=True)
+        child_path.write_text(json.dumps({"type": "PLANNER_RESPONSE", "step_index": 1, "status": "DONE",
+                                         "input_tokens": 30, "output_tokens": 40, "content": "Synthetic response"}) + "\n")
+        got = self.read(2)
+        self.assertEqual(got["input_tokens"], 10)
+        self.assertEqual(got["cost_usage"]["input_tokens"], 40)
+        self.assertEqual(got["cost_usage"]["missing_conversations"], 0)
+        with child_path.open("a") as stream:
+            stream.write(json.dumps({"type": "PLANNER_RESPONSE", "step_index": 2, "status": "DONE",
+                                    "input_tokens": 5, "output_tokens": 6, "content": "Second response"}) + "\n")
+        got = self.read(3)
+        self.assertEqual(got["cost_usage"]["input_tokens"], 45)
+        self.assertEqual(got["subagents"]["items"][0]["summary"], "Second response")
+
+    def test_cost_cache_is_bound_to_terminal_producer_and_conversation(self):
+        self.update(1, "idle")
+        self.update(2, "idle", terminal="t2", producer="101:123")
+        first = bridge.private_path(self.state, "t1", "100:123").with_suffix(".usage.json")
+        second = bridge.private_path(self.state, "t2", "101:123").with_suffix(".usage.json")
+        self.assertNotEqual(first, second)
+        value = json.loads(first.read_text())
+        value["binding"]["session_id"] = "another-session"
+        value["totals"]["input_tokens"] = 999
+        first.write_text(json.dumps(value))
+        self.assertEqual(self.read(3)["input_tokens"], 169032)
 
     def test_reader_refuses_stopped_process_wrong_terminal_or_mismatched_cache(self):
         self.update(1, "idle")

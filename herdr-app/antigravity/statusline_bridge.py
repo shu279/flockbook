@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Project the official agy status payload into a small, local Flockbook snapshot.
 
-No session text, credentials, network requests, or terminal control sequences are
-written to the snapshot. stdout is JSON for statusline.sh, never a debug log.
+Only bounded visible subagent previews are included, never prompts, thinking,
+credentials, or terminal control sequences. No network requests are made.
+stdout is JSON for statusline.sh, never a debug log.
 """
 
 import argparse
@@ -18,12 +19,16 @@ import sys
 import tempfile
 import time
 
-from statusline_usage import usage as transcript_usage
+from statusline_usage import usage as transcript_usage, usage_fingerprint
 
 SCHEMA = 1
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 ACTIVE = {"working", "tool_use"}
 MAX_PAYLOAD = 1024 * 1024
+USAGE_CHECK_NS = 5_000_000_000
+USAGE_RETRY_NS = 30_000_000_000
+USAGE_FIELDS = {"input_tokens", "output_tokens", "input_cached_tokens", "usage_scope", "usage_complete",
+                "usage_by_model", "cost_usage", "subagents"}
 
 
 def number(value, integer=False):
@@ -226,6 +231,84 @@ def add_usage(snapshot, previous=None):
     return snapshot
 
 
+def cached_usage(snapshot, state_dir, current_ns, *, force=False, legacy_state=None):
+    """Keep expensive usage sampling separate from the tiny producer clock.
+
+    Status callbacks check at most every five seconds; explicit UI reads check
+    file metadata immediately. Only changed files cause a transcript scan. A
+    separate cache persists reader refreshes without changing the Turn clock.
+    """
+    state_path = private_path(state_dir, snapshot["terminal_id"], snapshot["producer_id"])
+    cache_path = state_path.with_suffix(".usage.json")
+    rows_path = state_path.with_suffix(".usage-state.json")
+    binding = {key: snapshot.get(key) for key in ("session_id", "terminal_id", "producer_id", "transcript_path")}
+
+    def valid_cache(value):
+        return (isinstance(value, dict) and value.get("version") == 1 and value.get("binding") == binding
+                and isinstance(value.get("totals"), dict) and isinstance(value.get("watched"), list)
+                and set(value["totals"]).issubset(USAGE_FIELDS | {"source"})
+                and value["totals"].get("source") == "transcript"
+                and len(value["watched"]) <= 64 and number(value.get("checked_ns")) is not None
+                and number(value.get("scanned_ns")) is not None and isinstance(value.get("retry"), bool)
+                and value["checked_ns"] <= current_ns)
+
+    cache = read_snapshot(cache_path)
+    cache = cache if valid_cache(cache) else None
+
+    def apply(value):
+        snapshot.update({key: item for key, item in value.items() if key in USAGE_FIELDS})
+        snapshot["usage_source"] = value.get("source", "transcript")
+        return snapshot
+
+    if cache and not force and current_ns - cache["checked_ns"] < USAGE_CHECK_NS:
+        return apply(cache["totals"])
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(state_path.with_suffix(".usage.lock"), flags, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                # Another reader is already collecting this exact session.
+                return apply(cache["totals"]) if cache else snapshot
+            latest = read_snapshot(cache_path)
+            cache = latest if valid_cache(latest) else cache
+            if cache and not force and current_ns - cache["checked_ns"] < USAGE_CHECK_NS:
+                return apply(cache["totals"])
+            fingerprint = usage_fingerprint(binding["transcript_path"], cache["watched"] if cache else ())
+            retry = bool(cache and cache.get("retry") and current_ns - cache.get("scanned_ns", 0) >= USAGE_RETRY_NS)
+            if cache and fingerprint == cache.get("fingerprint") and not retry:
+                cache["checked_ns"] = current_ns
+                atomic_write(cache_path, cache)
+                return apply(cache["totals"])
+            previous = read_snapshot(rows_path, 16 * 1024 * 1024)
+            previous_state = (previous.get("state") if previous and previous.get("binding") == binding else legacy_state)
+            totals, usage_state = transcript_usage(binding["transcript_path"], previous_state)
+            watched = usage_state.get("watched_children", []) if isinstance(usage_state, dict) else []
+            if not watched:
+                watched = [item["id"] for item in object_value(totals.get("subagents")).get("items", [])]
+            fingerprint = usage_fingerprint(binding["transcript_path"], watched)
+            # Store the fstat observed before parsing, not a later append that
+            # has not been read yet. The next UI read then sees that append.
+            states = {"parent": usage_state}
+            if isinstance(usage_state, dict):
+                states.update(usage_state.get("child_states", {}))
+                fingerprint.update(usage_state.get("observed_files", {}))
+            for key, state in states.items():
+                if isinstance(state, dict) and all(field in state for field in ("dev", "ino", "size", "mtime_ns", "ctime_ns")):
+                    fingerprint[key] = [state[field] for field in ("dev", "ino", "size", "mtime_ns", "ctime_ns")]
+            cache = {"version": 1, "binding": binding, "checked_ns": current_ns, "scanned_ns": current_ns,
+                     "watched": watched, "fingerprint": fingerprint, "totals": totals,
+                     "retry": (not object_value(totals.get("cost_usage")).get("usage_complete", False)
+                               or not isinstance(usage_state, dict) or usage_state.get("version") != 4)}
+            atomic_write(rows_path, {"binding": binding, "state": usage_state})
+            atomic_write(cache_path, cache)
+            return apply(totals)
+    except (OSError, ValueError, TypeError):
+        # Terminal output and timing survive a missing/unwritable usage cache.
+        return apply(cache["totals"]) if cache else snapshot
+
+
 def read_current(path, terminal_id, *, state_dir=None, monotonic_ns=None, wall_ms=None, alive=producer_alive):
     """Sample elapsed time on the producer's clock, without mutating its state.
 
@@ -259,7 +342,8 @@ def read_current(path, terminal_id, *, state_dir=None, monotonic_ns=None, wall_m
     snapshot["producer_alive"] = True
     # The final transcript row can flush after the final status callback. Read
     # newly appended usage here too, without touching the producer's clock state.
-    return public_snapshot(add_usage(snapshot, previous))
+    return public_snapshot(cached_usage(snapshot, state_dir, current_ns, force=True,
+                                        legacy_state=previous.get("_usage")))
 
 
 def update(payload, *, state_dir=None, terminal_id=None, producer=None, wall_ms=None, monotonic_ns=None):
@@ -296,7 +380,10 @@ def update(payload, *, state_dir=None, terminal_id=None, producer=None, wall_ms=
             if previous and previous.get("_monotonic_ns", 0) > monotonic_ns:
                 return public_snapshot(previous)
             snapshot = advance(snapshot, previous, monotonic_ns)
-            add_usage(snapshot, previous)
+            old = object_value(previous)
+            boundary = (old.get("state") != snapshot["state"]
+                        or object_value(old.get("turn")).get("running") != snapshot["turn"]["running"])
+            cached_usage(snapshot, state_dir, monotonic_ns, force=boundary, legacy_state=old.get("_usage"))
             atomic_write(state_path, snapshot)
             if snapshot["transcript_path"] and snapshot["session_id"]:
                 suffix = f".{terminal_id}" if terminal_id else ""
