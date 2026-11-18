@@ -14,6 +14,7 @@ import { ROW_PAD_Y, BUBBLE_PAD_X, BUBBLE_PAD_Y, BUBBLE_GAP, IMAGES_FS, bubbleWid
   CALL_H, SEP_H, FOOTER_H, STATUS_H, CARD_ROW_H, OTHER_H } from "./metrics.js";
 import { Composer } from "./composer.js";
 import { ChatStatus } from "./chatstatus.js";
+import { ChatQueue } from "./queueview.js";
 import { markdownView, codeBlockAt } from "./mdblocks.js";
 import { textScale } from "./config.js";
 
@@ -80,6 +81,7 @@ export class ChatView {
     this.lastPoll = 0;
     this.composer = new Composer(cx);
     this.chatStatus = new ChatStatus();
+    this.chatQueue = new ChatQueue();
     this.composer.seen = (address) => { const f = this.feeds.get(address); return f ? { agent: f.agent ?? null, path: f.path ?? null } : null; };
     this.top = {}; startTop(cx, this.top);
     this.appear = new Appear();
@@ -87,6 +89,10 @@ export class ChatView {
     this.helper = new HelperUI();
     this.refresh = (cx) => { this.lastPoll = 0; return this.poll(cx); };
     this.composer.onNewConversation = (_address, cx) => this.refresh(cx);
+    this.composer.onSent = (address, cx) => {
+      const agent = currentAgent();
+      if (agent?.address === address) this.chatQueue.refresh(cx, agent, this.feed());
+    };
     this.cards.canFocus = () => this.composer?.empty !== false;
     this.switchTo(currentAgent()?.address ?? null);
     cx.spawn((cx) => this.poll(cx));
@@ -115,6 +121,7 @@ export class ChatView {
     cx.spawn((cx) => this.composer.pollStatus(cx));
     const agent = currentAgent();
     this.chatStatus.tick(cx, agent, this.feed());
+    this.chatQueue.tick(cx, agent, this.feed());
     cx.spawn((cx) => this.cards.poll(cx, this.address, wanted(agent, this.feed()?.rows)));
     if (this.wantOlder) { this.wantOlder = false; cx.spawn((cx) => this.loadOlder(cx)); }
     if (Date.now() - this.lastPoll >= POLL_MS) return this.poll(cx);
@@ -380,6 +387,8 @@ export class ChatView {
       .when(Boolean(this.helper.removeCard(t, this.refresh)), (el) => el.child(h_flex().w_full().px(16).pt(8).justify_center()
         .on_mouse_down("left", stop).child(this.helper.removeCard(t, this.refresh))))
       .when(Boolean(f) && f.error?.code !== "not-agent" && !isRemoteProblem(f.error), (el) => {
+        const queued = this.chatQueue.render(currentAgent(), f, t);
+        if (queued) el.child(queued);
         const card = this.cards.view(this.address, t, "chat-card");
         if (card) el.child(this.appear.wrap(h_flex().w_full().px(16).pt(8).justify_center().on_mouse_down("left", stop).child(card), "chat-card-in", `${this.address}:${this.cards.key?.(this.address) ?? ""}`, cx, 10));
         return el.child(div().w_full().on_mouse_down("left", stop).child(this.composer.render(currentAgent(), t)));

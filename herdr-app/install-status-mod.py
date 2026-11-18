@@ -16,7 +16,7 @@ BASE_SHA256 = {
     "composer.js": "71f79aec7eb671f7937b70a047b835f6dafae08c2e6d051880604ccba1e0d929",
     "estimate.js": "cfd222dbf59947fcfc24da56c33ed5fc45b8d72c21258552454f14695136dc26",
 }
-MODULES = (*BASE_SHA256, "chatstatus.js", "activity.js")
+MODULES = (*BASE_SHA256, "chatstatus.js", "activity.js", "queueparse.js", "queueview.js")
 
 
 def atomic_json(path, value, expected):

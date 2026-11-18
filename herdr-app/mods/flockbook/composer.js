@@ -224,6 +224,8 @@ export class Composer {
     this.seen = null;
     // (address, cx): the send found a new conversation of the same agent; the chat reads its feed again (set by the chat).
     this.onNewConversation = null;
+    // Refresh the actual CLI queue after a send; this does not enqueue anything itself.
+    this.onSent = null;
     this.files = [];
     this.sending = false;
     this.activity = new ChatActivity();
@@ -401,6 +403,7 @@ export class Composer {
       } else if (done.result === "unconfirmed") {
         this.note = { text: "Sent. The agent did not confirm it yet.", bad: false };
       }
+      if (accepted) this.onSent?.(a, cx);
     } finally { this.activity.finish(activity, accepted, cx); this.sending = false; cx.notify(); }
   }
 
