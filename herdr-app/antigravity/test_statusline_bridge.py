@@ -53,6 +53,28 @@ class BridgeTests(unittest.TestCase):
         for value in (-1, float("nan"), float("inf"), True, "0.25"):
             self.assertIsNone(self.update(4, cost={"total_usd": value})["cost_usd"])
 
+    def test_snapshot_read_limit_includes_large_tree_breakdowns_and_bounds_utf8_bytes(self):
+        path = self.root / "large-snapshot.json"
+        buckets = [{"model": f"unknown-{i}-" + "x" * 140, "input_tokens": 1,
+                    "output_tokens": 1, "input_cached_tokens": 1, "requests": 1} for i in range(256)]
+        value = {"usage_by_model": buckets, "cost_usage": {"usage_by_model": buckets}}
+        path.write_text(json.dumps(value, separators=(",", ":")))
+        self.assertGreater(path.stat().st_size, 32768)
+        self.assertEqual(bridge.read_snapshot(path), value)
+        limit = 256 * 1024
+        overhead = len(json.dumps({"padding": ""}, separators=(",", ":")).encode("utf-8"))
+        path.write_text(json.dumps({"padding": "x" * (limit - overhead)}, separators=(",", ":")))
+        self.assertEqual(path.stat().st_size, limit)
+        self.assertIsNotNone(bridge.read_snapshot(path))
+        with path.open("a") as handle:
+            handle.write(" ")
+        self.assertIsNone(bridge.read_snapshot(path))
+        path.write_text(json.dumps({"padding": "界" * ((limit - overhead) // 3 + 1)},
+                                   ensure_ascii=False, separators=(",", ":")))
+        self.assertLess(len(path.read_text()), limit)
+        self.assertGreater(path.stat().st_size, limit)
+        self.assertIsNone(bridge.read_snapshot(path))
+
     def test_active_only_timer_pauses_for_confirmation_and_idle(self):
         self.update(1, "idle")
         first = self.update(5, "working")

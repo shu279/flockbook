@@ -32,6 +32,34 @@ test("capture identity binds machine, terminal and exact conversation path", () 
   assert.equal(parseStatus(" ".repeat(32769), id), null);
 });
 
+test("status accepts model-rich snapshots through 256 KiB and rejects larger UTF-8 payloads", () => {
+  const id = statusIdentity(a(), feed()), limit = 256 * 1024;
+  const buckets = Array.from({ length: 256 }, (_, i) => ({ model: `unknown-${i}-${"x".repeat(140)}`,
+    input_tokens: 1, output_tokens: 1, input_cached_tokens: 1, requests: 1 }));
+  const large = snapshot({ usage_by_model: buckets, cost_usage: { usage_by_model: buckets } });
+  assert.ok(Buffer.byteLength(large) > 32768);
+  assert.equal(parseStatus(large, id).input, 169032, "cost breakdown size does not discard the rest of the status");
+  const overhead = Buffer.byteLength(snapshot({ padding: "" }));
+  const boundary = snapshot({ padding: "x".repeat(limit - overhead) });
+  assert.equal(Buffer.byteLength(boundary), limit);
+  assert.ok(parseStatus(boundary, id));
+  assert.equal(parseStatus(boundary + " ", id), null);
+  const unicode = snapshot({ padding: "界".repeat(Math.floor((limit - overhead) / 3) + 1) });
+  assert.ok(unicode.length < limit);
+  assert.ok(Buffer.byteLength(unicode) > limit);
+  assert.equal(parseStatus(unicode, id), null, "the limit counts UTF-8 bytes, not just string characters");
+});
+
+test("an excessive model bucket count makes only cost unavailable", async () => {
+  const buckets = Array.from({ length: 257 }, (_, i) => ({ model: `unknown-${i}-${"x".repeat(140)}`,
+    input_tokens: 1, output_tokens: 1, input_cached_tokens: 1, requests: 1 }));
+  fake.exec = () => reply(snapshot({ usage_by_model: buckets, usage_scope: "conversation", usage_complete: true }));
+  const bar = new ChatStatus(() => 1000), cx = fakeCx();
+  bar.tick(cx, a(), feed()); await cx.settle();
+  assert.match(bar.text(a(), feed()), /Gemini 4 Carbon \(High\).*In: 169,032.*Out: 208,355.*API換算: N\/A.*Turn: 42s/);
+  assert.doesNotMatch(bar.text(a(), feed()), /更新待ち/);
+});
+
 test("missing/invalid numbers are N/A; actual zero and small nonzero costs remain distinct", () => {
   for (const v of [null, undefined, NaN, -1, "0", Infinity]) {
     assert.equal(formatTokens(v), "N/A"); assert.equal(formatCost(v), "N/A");
@@ -50,7 +78,7 @@ test("remote file reads use Herdr on, while elapsed interpolation uses the Mac r
   const bar = new ChatStatus(() => clock), cx = fakeCx();
   bar.tick(cx, a(), feed()); await cx.settle();
   assert.deepEqual(reads[0], ["python3", ["/home/user/.gemini/antigravity-cli/statusline_bridge.py", "--read", `${path}.flockbook-status.t1.json`, "--terminal", "t1"], { on: "cloud", timeout: 3000 }]);
-  assert.match(bar.text(a(), feed()), /Gemini 4 Carbon \(High\).*In: 169,032.*Out: 208,355.*Est: N\/A.*Turn: 42s/);
+  assert.match(bar.text(a(), feed()), /Gemini 4 Carbon \(High\).*In: 169,032.*Out: 208,355.*API換算: N\/A.*Turn: 42s/);
   clock = 3000; bar.tick(cx, a(), feed()); await cx.settle();
   assert.match(bar.text(a(), feed()), /Turn: 44s/, "re-reading one unchanged snapshot does not restart its anchor");
   clock = 9000;
@@ -160,7 +188,7 @@ test("status is fixed after the composer and remains when there is no agent or t
   let rendered = chat.render(cx);
   const footer = byId(rendered, "chat-status");
   assert.ok(footer);
-  assert.match(textOf(footer), /Model: N\/A.*In: N\/A.*Out: N\/A.*Est: N\/A.*Turn: N\/A/);
+  assert.match(textOf(footer), /Model: N\/A.*In: N\/A.*Out: N\/A.*API換算: N\/A.*Turn: N\/A/);
   assert.equal(rendered.kids.at(-2), footer, "the footer is outside scrolling chat content, immediately before the absolute top bar");
   fake.agents = []; chat.switchTo(null); rendered = chat.render(cx);
   assert.ok(byId(rendered, "chat-status"));
@@ -168,4 +196,36 @@ test("status is fixed after the composer and remains when there is no agent or t
   fake.exec = () => { throw new Error("must not read during herdr-app check"); };
   const bar = new ChatStatus(); bar.tick(cx, a(), feed()); await cx.settle();
   assert.match(textOf(bar.render(a(), feed(), theme())), /Turn: N\/A/);
+});
+
+test("the status bar prices historical models and cache in yen without using a different-scope CLI total", async () => {
+  fake.exec = () => reply(snapshot({ input_tokens: 1000100, input_cached_tokens: 2000000, output_tokens: 100000,
+    cost_usd: 999, usage_scope: "conversation", usage_complete: true, usage_by_model: [
+      { model: "gemini-4-carbon-high", input_tokens: 1000000, input_cached_tokens: 2000000, output_tokens: 100000, requests: 2 },
+      { model: null, input_tokens: 100, input_cached_tokens: 0, output_tokens: 0, requests: 1 },
+    ] }));
+  const bar = new ChatStatus(() => 1000), cx = fakeCx();
+  bar.tick(cx, a(), feed()); await cx.settle();
+  assert.match(bar.text(a(), feed()), /API換算: 約¥1,020＋（親のみ）（一部未計上）/);
+  const id = statusIdentity(a(), feed());
+  assert.equal(bar.entries.get(id.key).snapshot.cost, 999, "the CLI's separate estimate remains available");
+  assert.ok(byId(bar.render(a(), feed(), theme()), "chat-cost"));
+  bar.costDetails.open(cx, {});
+  assert.match(textOf(bar.render(a(), feed(), theme())), /未計上/);
+  bar.text(a("cloud/t2"), feed("cloud/t2"));
+  assert.equal(bar.costDetails.isOpen, false, "another agent does not inherit an open detail panel");
+});
+
+test("tree cost keeps parent token counters and follows the selected session", async () => {
+  const usage = { usage_scope: "conversation_tree", usage_complete: true, conversations: 3, missing_conversations: 0,
+    input_tokens: 3000000, input_cached_tokens: 0, output_tokens: 0,
+    usage_by_model: [{ model: "gemini-4-argon-high", input_tokens: 3000000, input_cached_tokens: 0, output_tokens: 0, requests: 3 }] };
+  fake.exec = () => reply(snapshot({ input_tokens: 1000000, input_cached_tokens: 0, output_tokens: 0,
+    cost_usage: usage, usage_scope: "conversation", usage_complete: true,
+    usage_by_model: [{ model: "gemini-4-argon-high", input_tokens: 1000000, input_cached_tokens: 0, output_tokens: 0, requests: 1 }] }));
+  const bar = new ChatStatus(() => 1000), cx = fakeCx();
+  bar.tick(cx, a(), feed()); await cx.settle();
+  assert.match(bar.text(a(), feed()), /In: 1,000,000.*API換算: 約¥1,912 │/);
+  assert.equal(bar.entries.get(statusIdentity(a(), feed()).key).snapshot.cost_usage.conversations, 3);
+  assert.match(bar.text(a("cloud/t2"), feed("cloud/t2")), /API換算: N\/A/);
 });

@@ -4,8 +4,12 @@ import { div } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
 import { exec, machines, terminals, checking } from "herdr";
 import { machineOf } from "./state.js";
+import { costReference } from "./config.js";
+import { estimateCost, formatYen } from "./cost.js";
+import { CostDetails } from "./costview.js";
 
 export const ACTIVE_POLL_MS = 1000, IDLE_POLL_MS = 2000;
+const MAX_STATUS_BYTES = 256 * 1024; // Match statusline_bridge.read_snapshot, including tree usage buckets.
 const number = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null;
 const count = (v) => Number.isSafeInteger(v) && v >= 0 ? v : null;
 const label = (v) => typeof v === "string" ? v.replace(/[\x00-\x1f\x7f]/g, "").slice(0, 160).trim() : "";
@@ -27,7 +31,15 @@ export function statusIdentity(agent, feed) {
 
 // Reject a different session or terminal, even when a stale request finishes after navigation.
 export function parseStatus(text, id) {
-  if (typeof text !== "string" || text.length > 32768 || !id) return null;
+  if (typeof text !== "string" || text.length > MAX_STATUS_BYTES || !id) return null;
+  // The producer writes UTF-8. Count bytes as well as UTF-16 length so a large
+  // Unicode model label cannot bypass the same bound enforced by the reader.
+  let bytes = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0);
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+    if (bytes > MAX_STATUS_BYTES) return null;
+  }
   let v; try { v = JSON.parse(text); } catch { return null; }
   if (!v || v.schema !== 1 || v.session_id !== id.session || v.transcript_path !== id.path || v.terminal_id !== id.terminal
     || count(v.observed_at_ms) === null || count(v.sampled_at_ms) === null || v.producer_alive !== true
@@ -35,7 +47,11 @@ export function parseStatus(text, id) {
     || (id.pid !== null && !v.producer_id.startsWith(`${id.pid}:`))) return null;
   const turn = v.turn && typeof v.turn === "object" ? v.turn : {};
   return { observed: v.observed_at_ms, sampled: v.sampled_at_ms, producer: v.producer_id, name: label(v.model?.name), effort: label(v.model?.effort),
-    input: count(v.input_tokens), output: count(v.output_tokens), cost: number(v.cost_usd), subcost: number(v.subagent_usd),
+    input: count(v.input_tokens), output: count(v.output_tokens), cached: count(v.input_cached_tokens),
+    cost: number(v.cost_usd), subcost: number(v.subagent_usd),
+    usage_by_model: Array.isArray(v.usage_by_model) ? v.usage_by_model : null,
+    usage_scope: label(v.usage_scope), usage_complete: v.usage_complete === true,
+    ...(Object.prototype.hasOwnProperty.call(v, "cost_usage") ? { cost_usage: v.cost_usage } : {}),
     state: label(v.state), turn: { id: label(turn.id), elapsed: turn.complete === true ? number(turn.elapsed_ms) : null,
       running: turn.running === true && turn.complete === true, complete: turn.complete === true } };
 }
@@ -66,6 +82,7 @@ export class ChatStatus {
     this.inFlight = false;
     this.shown = null;
     this.lastText = "";
+    this.costDetails = new CostDetails();
   }
 
   elapsed(entry, at = this.clock()) {
@@ -94,6 +111,7 @@ export class ChatStatus {
   select(id) {
     const key = id?.key ?? null;
     if (key !== this.shown) {
+      this.costDetails.close();
       const previous = this.entries.get(this.shown);
       // While another chat is shown we cannot observe every state transition here.
       // Reopening it gets authoritative elapsed time from the remote reader first.
@@ -150,12 +168,16 @@ export class ChatStatus {
     const entry = id ? this.entries.get(id.key) : null;
     // Rendering also sees live Herdr transitions before the next 400 ms chat tick.
     if (entry && (!online(id, feed) || agent.status !== "working")) this.freeze(entry, !online(id, feed));
-    const s = entry?.snapshot, ms = this.elapsed(entry);
-    return `Model: ${modelText(s)} │ In: ${formatTokens(s?.input)} │ Out: ${formatTokens(s?.output)} │ Est: ${formatCost(s?.cost)} │ Turn: ${ms === null ? "N/A" : `${Math.floor(ms / 1000)}s`}${entry?.stale ? " │ 更新待ち" : ""}`;
+    const s = entry?.snapshot, ms = this.elapsed(entry), estimate = estimateCost(s, costReference());
+    const cost = formatYen(estimate.jpy, { partial: estimate.partial });
+    const scope = estimate.jpy !== null && estimate.scope === "conversation" ? "（親のみ）" : "";
+    return `Model: ${modelText(s)} │ In: ${formatTokens(s?.input)} │ Out: ${formatTokens(s?.output)} │ API換算: ${cost}${scope}${estimate.partial && estimate.jpy !== null ? "（一部未計上）" : ""} │ Turn: ${ms === null ? "N/A" : `${Math.floor(ms / 1000)}s`}${entry?.stale ? " │ 更新待ち" : ""}`;
   }
 
   render(agent, feed, t) {
     const text = this.text(agent, feed);
+    const id = statusIdentity(agent, feed), snapshot = id ? this.entries.get(id.key)?.snapshot : null;
+    const estimate = estimateCost(snapshot, costReference());
     return v_flex().id("chat-status").w_full().flex_none()
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .child(div().h(1).w_full().bg(t.border))
@@ -163,6 +185,14 @@ export class ChatStatus {
         .bg(t.background).text_size(11.5).text_color(t.muted)
         .children(text.split(" │ ").map((part, i) => h_flex().flex_none().gap(4).items_center()
           .when(i > 0, (el) => el.child(div().text_color(t.dim).child("│")))
-          .child(div().child(part)))));
+          .child(div().child(part)
+            .when(part.startsWith("API換算:"), (el) => el.id("chat-cost").tab_index(0)
+              .tooltip("この会話と関連する子Agentの公開API単価による参考額（割引前）。クリックで集計範囲・単価・為替・未計上分を確認。")
+              .hover((style) => style.text_color(t.foreground))
+              .on_click((_e, cx) => this.costDetails.toggle(cx, costReference()))
+              .on_key_down((e, cx) => {
+                if (["enter", "space", " "].includes(e?.key)) { cx.stop_propagation?.(); this.costDetails.toggle(cx, costReference()); }
+              }))))))
+      .when(this.costDetails.isOpen, (el) => el.child(this.costDetails.render(estimate, snapshot, t)));
   }
 }

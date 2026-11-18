@@ -176,7 +176,7 @@ def advance(snapshot, previous, monotonic_ns):
     return snapshot
 
 
-def read_snapshot(path, max_bytes=32768):
+def read_snapshot(path, max_bytes=256 * 1024):
     try:
         if path.is_symlink() or path.stat().st_size > max_bytes:
             return None

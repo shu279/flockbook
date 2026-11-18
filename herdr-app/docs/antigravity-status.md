@@ -1,6 +1,6 @@
 # Antigravity Chat Status Bar
 
-Herdr内で動くFlockbookのChat入力欄の下に、Model／In／Out／Est／Turnを常時表示します。
+Herdr内で動くFlockbookのChat入力欄の下に、Model／In／Out／API換算（円）／Turnを常時表示します。
 独立したSwift版Flockbook Mac Appの変更ではありません。既存のMarkdown描画、入力・承認操作、Agent管理を維持します。
 
 入力欄の上には「送信しています…」「応答を待っています…」「処理しています…」を表示します。Herdrが現在の作業内容を報告する場合はその文言を使い、完了時は消えます。承認待ち・接続待ちは回転表示を止めます。表示はTerminal・会話・PIDごとに分離し、送信が確認できない場合も30秒後に未確認の表示へ切り替えます。アニメーションはHerdrネイティブ機能を使用し、追加の通信やポーリングは行いません。
@@ -14,7 +14,7 @@ Antigravityの実際の待機メッセージも、入力欄の上に「キュー
 ## データと計測
 
 - GCE側の`statusline.sh`が[公式Status Line API](https://antigravity.google/docs/cli/statusline/)のJSONを受け取ります。元スクリプトのANSI色、桁区切り、モデル・Effort、subagent cost表示、画面幅に応じた折り返しを再利用しています。
-- モデル・Effort・コスト・Agent状態はAPIから取得します。`cost`未報告時は`N/A`。公開価格や課金額を推測してゼロにしません。明示的に報告されたゼロだけをゼロとして表示します。
+- モデル・Effort・Agent状態はAPIから取得します。公式`cost.total_usd`は現在の環境では未報告です。Terminalの既存Est表示はこの値を使用し、未報告時は`N/A`を維持します。Chatの「API換算」は下記の公開単価による独立した参考額です。
 - CLI 1.5.10の実機では`context_window.total_input_tokens`が現在のコンテキスト量と一致し、累計ではありませんでした。そのためIn／Outは対応する`transcript_full.jsonl`の使用量を累計します。Inは[公式headless usageの定義](https://antigravity.google/docs/cli/headless/)と同じ`input_tokens`累計で、別項目の`cache_read_tokens`は加算しません。Outは`output_tokens`累計です。使用量が記録された時点で増えます。
 - Turnは`working`／`tool_use`の区間だけをGCEの単調増加時計で積算します。Idle、承認待ち、reviewing、認証中は加算しません。次の作業開始でリセットします。Session Wall Timeは表示しません。
 - 導入時点で既に作業中だったターンは開始境界を観測できないため`N/A`です。Idleから次の作業開始を観測すれば計測が始まります。ログの`created_at`は処理終了時刻ではないため、代わりには使いません。
@@ -24,9 +24,22 @@ Antigravityの実際の待機メッセージも、入力欄の上に「キュー
 
 追加のSSH接続、認証情報、外部HTTP APIは使用しません。JSONキャッシュは0600、内部状態用ディレクトリは0700です。会話本文、メールアドレス、認証情報はキャッシュへ保存しません。
 
+## 円での使用量管理
+
+Chatの「API換算」は、**この会話と明示的に起動した子Agentの、割引前の公開API単価相当額**です。金額をクリックすると、モデル別の入力／キャッシュ読込／出力、USD相当額、未計上の件数、集計範囲、為替レートを表示します。In／Outは従来どおり親会話の累計です。
+
+- 使用量を各リクエストに記録されたモデル別に集計します。途中でCarbonからArgonへ変更しても、過去の使用量を現在のモデルで再計算しません。推論トークンは出力に含まれるため重複加算しません。
+- 子Agentは、親ログの`invoke_subagent`応答にある作成結果を照合して追跡します。同じbrainディレクトリの会話ID・ログURIを検証し、入れ子を再帰集計します。重複・循環には一度だけ計上し、無関係なAgentや最新ログを検索して混ぜません。読取不能・探索制限・不完全な使用量は未計上扱いです。
+- モデル不明のCHECKPOINTなどは近隣のモデルから推測しません。既知分だけを`約¥…＋（一部未計上）`と表示し、詳細に未計上を示します。計算できる記録がなければ`N/A`です。古いBridgeの親会話のみのデータには`（親のみ）`を表示します。
+- [Googleの公開料金](https://cloud.google.com/model-garden/pricing)を2026-11-18に確認し、Gemini 4 Carbon／ArgonのGlobal Standardを基準にしています。100万トークン当たり入力$4、キャッシュ読込$0.20、出力$20です。11月の50%クレジット還元は適用しません。High等はReasoning Effortで、Priorityサービス料金とは区別します。未知のモデルに別モデルの単価を流用しません。
+- 実際の課金経路・リージョンはログから確定できないため、Global Standardは明示した計算基準です。請求額、サブスクリプション枠、クレジット、契約割引、ツール料金、税金は含みません。
+- 初期為替は[日銀2026-11-17の17時USD/JPY](https://www.boj.or.jp/statistics/market/forex/fxdaily/fxlist/fx261117.pdf)159.33–35の中値、**1 USD = 159.34円**。自動更新せず、詳細パネルの入力欄から変更できます。請求に使われる[Cloudの月次換算](https://docs.cloud.google.com/billing/docs/resources/currency)とは異なります。
+
+為替を保存すると既存のFlockbook設定に`cost_reference`だけを追加・更新します。他の設定は維持します。必要なら同項目の`region`を`"non-global"`に指定でき、その場合の単価は入力$4.40／キャッシュ$0.22／出力$22です。単価と初期為替はバージョンに固定されているため、公開価格改定時には更新が必要です。
+
 ## 導入
 
-必要なものは、導入済みのFlockbook Herdr Mod、接続済みHerdr machine、GCEのPython 3／jq／Bashです。元ModはこのForkの基点`49466a1`と同じ`chat.js`・`composer.js`・`estimate.js`を対象にしています。変更済みの対象ファイルや既存の導入先には上書きせず停止します。
+必要なものは、導入済みのFlockbook Herdr Mod、接続済みHerdr machine、GCEのPython 3／jq／Bashです。元ModはこのForkの基点`49466a1`と同じ`chat.js`・`composer.js`・`estimate.js`・`config.js`を対象にしています。変更済みの対象ファイルや既存の導入先には上書きせず停止します。
 
 リポジトリルートでMac側を導入します。
 
@@ -47,6 +60,8 @@ python3 -B herdr-app/antigravity/deploy.py --machine MACHINE --expected-sha256 R
 
 稼働中のCLIは次のStatus Line呼び出しから変更を読み込みます。Idle中に呼び出されなければ次の通常操作で反映します。既存の会話へ検証用メッセージを送る必要はありません。
 
+今回の円換算対応は、既存のカスタム`flockbook-status`をバックアップしてから、`config.js`・`chatstatus.js`・`cost.js`・`costview.js`だけを更新しました。GCEは上記デプロイ手順でPython helperを更新しています。元の`flockbook`には変更を加えていません。別環境へ導入する場合は新規インストール手順を使い、既存カスタムModがある場合は変更を比較してからマージしてください。
+
 ## 元に戻す
 
 Macは元Layoutへ切り替えるだけです。
@@ -62,6 +77,8 @@ hc exec --on MACHINE sh -c 'cp "$HOME/.gemini/antigravity-cli/flockbook-status-b
 ```
 
 元Layout／Mod／設定をバックアップ一式で無条件に上書きしないでください。導入後のユーザー変更を失わないためです。
+
+円換算対応だけを戻す場合は、Macの`~/.config/herdr-app/flockbook-status-backups/yen-20261118T033252.863837Z/flockbook-status`にある更新前のModと比較し、今回変更したファイルだけを復元できます。GCE側も対応する導入前バックアップのPython helperを復元できます。`settings.json`の復元は不要です。
 
 ## 検証
 
@@ -83,8 +100,8 @@ macOS上のHerdr App 0.1.16／GCE Linux上のAntigravity CLI 1.5.10で検証し�
 
 | 検証 | 結果 |
 |---|---|
-| Mod全体の自動テスト | 363件中358成功、5件は既存の環境依存スキップ、失敗0 |
-| Python Bridge／トークン集計／Terminal表示 | 27件成功（上記Modテストからも実行） |
+| Mod全体の自動テスト | 390件中385成功、5件は既存の環境依存スキップ、失敗0 |
+| Python Bridge／トークン集計／Terminal表示 | 51件成功（上記Modテストからも実行） |
 | Herdr Modのネイティブロード・コンパイル | ソース／導入先とも`check passed`、実行時エラーなし |
 | Chat入力 | 実際の入力欄から検証用Agentへ送信成功 |
 | 処理中表示 | 専用の実CLIで、送信直後→処理中→完了時に非表示を確認。普段の作業中Agentでも表示 |
@@ -95,14 +112,16 @@ macOS上のHerdr App 0.1.16／GCE Linux上のAntigravity CLI 1.5.10で検証し�
 | Idle除外 | 25.071秒間隔の読取で21,765.210msのまま一致 |
 | 2 Agentの切替 | High: In17,168／Out475／21秒、Low: In8,801／Out8／5秒。切替後も混在なし |
 | 元Terminal表示 | 両AgentでANSI Status Lineを継続表示 |
-| 未取得コスト | 実APIの`cost`欠落を確認し、Chat／Terminalとも`N/A` |
+| 円換算 | 実APIの`cost`欠落を確認。Chatではログのモデル別使用量を公開単価で円換算。Terminalの公式Estは`N/A`を維持 |
+| 子Agent合算 | 親ログに明示された子ログだけを追跡し、親In／Outを維持。実ログの読取約73ms、Herdr経由の読取約247ms |
+| 料金内訳 | 実画面で円・USD・未計上件数・子Agent範囲・モデル別単価・為替を確認。開閉と詳細内スクロール成功。為替保存の設定保全は自動テストで検証 |
 | 設定保全 | GCEの`settings.json`はバックアップと完全一致。元Mod／既存キー設定も維持 |
 
 実機の接続を意図的に切る試験はしていません。切断時の停止・再接続、非同期応答の逆転、同一会話の別端末、プロセス再起動、承認待ちの時間除外は合成データのテストで確認しています。課金額の取得や実際の承認送信は検証対象外です。
 
 ## 制約
 
-- コストはCLIが報告するAPI相当の推定値です。現在のGCE環境では未報告なので`N/A`になります。サブスクリプション料金やGCP請求額の計算には使いません。
+- 円換算は会話単位の公開単価相当額です。別の独立した会話をまたぐ日次・月次合算、予算上限通知、実請求額の照合は行いません。モデル不明・単価未登録・未読取の使用分は未計上です。
 - ログに未記録のストリーミング途中のトークン数は取得できません。モデル応答などの使用量確定時に更新します。
 - 状態遷移の分解能はCLIのStatus Line呼び出しに依存します（公式仕様では最大300ms間隔）。CLIが状態通知せず強制終了した区間は正確な終了時刻を復元できず、読取失敗／更新待ちとして扱います。
 - 接続を切った実機試験は既存の作業へ影響するため行わず、切断・エラー・再接続は自動テストで検証します。

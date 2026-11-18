@@ -41,6 +41,12 @@ export function setting(key) {
   return CHOICES[key].includes(v) ? v : DEFAULTS[key];
 }
 export const configBad = () => shared(KEY_CONFIG)?.bad === true;
+// The optional API-equivalent cost reference. Validated by cost.js; a missing
+// field uses its dated, published reference rates without changing this file.
+export function costReference() {
+  const value = shared(KEY_CONFIG)?.file?.cost_reference;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
 
 // Reads the file again (someone may have edited it); shares it only when it changed.
 export async function loadConfig() {
