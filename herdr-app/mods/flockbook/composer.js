@@ -6,6 +6,7 @@ import { theme, panes, home, exec, window } from "herdr";
 import { agentName, icon, SPIN_MS } from "./state.js";
 import * as sidecar from "./sidecar.js";
 import { setting } from "./config.js";
+import { ChatActivity, activityView } from "./activity.js";
 
 export const STATUS_MS = 5000;
 
@@ -225,6 +226,7 @@ export class Composer {
     this.onNewConversation = null;
     this.files = [];
     this.sending = false;
+    this.activity = new ChatActivity();
     this.note = null;          // { text, bad } under the box, after a send
     this.status = new Map();   // address → status line
     this.statusAt = 0;
@@ -378,12 +380,16 @@ export class Composer {
     const s = text !== this.slashClosed ? this.slashFor(text) : null;
     if (s && !s.items.some((c) => c.name === s.query)) return this.complete(s, s.items[s.pick], cx);
     const files = b.files;
+    const seen = this.seen?.(a) ?? null;
+    const activity = this.activity.begin(this.agent, seen);
+    let accepted = false;
     this.sending = true; this.note = null;
     b.setText(""); b.files = [];
     cx.notify();
     try {
-      const r = await sidecar.send(a, withFiles(text, files), files, this.seen?.(a) ?? null);
+      const r = await sidecar.send(a, withFiles(text, files), files, seen);
       const done = r.lines.find((l) => l.type === "done");
+      accepted = !r.error && (done?.result === "sent" || done?.result === "unconfirmed");
       const moved = sidecar.agentChanged(done), fresh = sidecar.newConversation(done);
       // Only "sent" and "unconfirmed" (it may still arrive) mean the text went out; any other result did not send.
       if (r.error || !done || (done.result !== "sent" && done.result !== "unconfirmed")) {
@@ -395,7 +401,7 @@ export class Composer {
       } else if (done.result === "unconfirmed") {
         this.note = { text: "Sent. The agent did not confirm it yet.", bad: false };
       }
-    } finally { this.sending = false; cx.notify(); }
+    } finally { this.activity.finish(activity, accepted, cx); this.sending = false; cx.notify(); }
   }
 
   render(agent, t) {
@@ -403,6 +409,8 @@ export class Composer {
     const branch = tags.find((x) => x.kind === "branch");
     const b = this.box(agent);
     if (!b) return div();
+    const activity = this.activity.describe(agent, this.seen?.(agent.address) ?? null);
+    const sendingHere = this.sending && this.activity.pending.get(agent.address)?.phase === "sending";
     const s = this.slash();
     const shown = s ? s.items.slice(s.top, s.top + SLASH_ROWS) : [];
     const row = (c, j) => h_flex().id(`slash-${s.top + j}`).w_full().h(ROW_PX).px(10).gap(10).items_center().rounded(8)
@@ -431,6 +439,7 @@ export class Composer {
     return v_flex().id("composer").w_full().px(16).pb(14).pt(6).gap(6).items_center()
       .key_context(PASTE_CONTEXT)
       .on_action(PASTE_ACTION, (_e, cx) => { const text = cx.read_from_clipboard?.(); cx.spawn((cx) => this.paste(cx, text)); })
+      .when(Boolean(activity), (el) => el.child(activityView(activity, t)))
       .when(setting("status_row") !== "hide", (el) => el.child(h_flex().id("tags").w_full().max_w(800).gap(5).items_center().overflow_x_scroll().children(tags.map(tag))))
       .when(Boolean(s), (el) => el.child(v_flex().id("slash").w_full().max_w(800).p(4).gap(0).rounded(12).bg(t.raised)
         .border(1).border_color(t.border).shadow_sm().on_scroll_wheel((e, cx) => this.slashWheel(e, cx))
@@ -454,7 +463,7 @@ export class Composer {
           .child(div().id("send").size(28).flex_none().flex().items_center().justify_center().rounded(14)
             .bg(empty || this.sending ? t.chrome : t.accent).text_color(empty || this.sending ? t.dim : t.background)
             .on_click((_e, cx) => cx.spawn((cx) => this.submit(cx)))
-            .child(this.sending ? svg(icon("spinner")).size(13).spin(SPIN_MS) : svg(icon("send")).size(14)))))
+            .child(sendingHere ? svg(icon("spinner")).size(13).spin(SPIN_MS) : svg(icon("send")).size(14)))))
       .when(Boolean(this.note), (el) => el.child(div().id("send-note").w_full().max_w(800).text_size(12)
         .text_color(this.note.bad ? t.blocked : t.muted).child(this.note.text)));
   }

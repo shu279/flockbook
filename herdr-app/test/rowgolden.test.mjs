@@ -12,7 +12,8 @@ import { TEXTS, KNOWN_MISMATCH, WIDTHS, ROWS } from "./rowgolden.texts.mjs";
 // markdownHeight at WIDTHS (748, 400).
 const MARKDOWN = {
   short: [32, 32], latin: [110, 188], latinParas: [104, 182], softBreaks: [32, 58], cjk: [84, 136], cjkReply: [160, 238],
-  inlineCode: [84, 162], nestedList: [178, 178], listAfterPara: [128, 128], heading: [166, 166], quote: [58, 58],
+  // Heading was166: standalone/adjacent headings use native heading leading, not body leading +12px.
+  inlineCode: [84, 162], nestedList: [178, 178], listAfterPara: [128, 128], heading: [122, 122], quote: [58, 58],
   // table and tableInText were [128, 149] and [158, 158]: table lines are 22 px, not 21 (fix/cut-msg-table-list).
   rule: [104, 104], table: [131, 153], tableInText: [160, 160], code: [134, 134], codeLong: [76, 118],
   twoCodes: [163, 163], codeUnclosed: [108, 108],

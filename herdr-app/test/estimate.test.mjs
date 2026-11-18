@@ -4,7 +4,7 @@
 // a full-width character 16 px wide, inline code Menlo 8.4 px a character plus 4 px padding each side.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { markdownHeight, rowHeight, lineHeight } from "../mods/flockbook/estimate.js";
+import { markdownHeight, rowHeight, lineHeight, inlineVisibleText, colWidths } from "../mods/flockbook/estimate.js";
 
 const W = 748;
 const LINE = 26, GAP = 10, ITEM_GAP = 4;
@@ -24,6 +24,50 @@ const reply = [
   "",
   "要不要做？要的話，我等 build-bot 修完 Shift+Enter，再接著交給它。它熟 `grid.js`，也最能避開和設定畫面的衝突，順便補上測試。",
 ].join("\n");
+
+test("citation URLs and titles contribute no height; only their visible labels wrap", () => {
+  const target = "https://example.test/research/" + "long-destination/".repeat(12);
+  const labels = Array.from({ length: 9 }, (_, i) => `確認した資料${i + 1}に基づく説明です。`);
+  const cited = labels.map((label) => `[${label}](${target} \"A source title\")`).join("\n\n");
+  assert.equal(markdownHeight(cited, 760), markdownHeight(labels.join("\n\n"), 760));
+  assert.equal(markdownHeight(cited, 320), markdownHeight(labels.join("\n\n"), 320));
+  const table = (cell) => `| Source | Result |\n|---|---|\n| ${cell} | Verified |`;
+  assert.equal(markdownHeight(table(`[資料](${target})`), 400), markdownHeight(table("資料"), 400));
+  assert.deepEqual(colWidths(400, [[`[資料](${target})`, "Verified"]], 2), colWidths(400, [["資料", "Verified"]], 2));
+});
+
+test("inline links handle balanced targets, escaped delimiters and formatted labels", () => {
+  assert.equal(inlineVisibleText("[**Source one**](https://example.test/a_(b))"), "**Source one**");
+  assert.equal(inlineVisibleText("[`sample`](<https://example.test/a(b)> 'title (x)')"), "`sample`");
+  assert.equal(inlineVisibleText("[A\\]B](https://example.test/a\\)b)"), "A\\]B");
+  assert.equal(inlineVisibleText("[empty]()"), "empty");
+  assert.equal(inlineVisibleText("Before [one](a) and [two](b) after"), "Before one and two after");
+});
+
+test("link examples in code, escaped markup, images and malformed links keep conservative widths", () => {
+  for (const text of ["`[label](https://example.test)`", "``[label](target)``", "``x`[label](target)`z", "`x``[label](target)`", "\\[literal](target)", "![image](target)", "[label](unclosed", "[label](not a valid target)", "[label](target \"unclosed)", "[a [b](inner)](outer)", "[a [b][ref]](outer)", "[a [b]](outer)", "[label](<https://example.test>suffix)", "[label](https://example.test/<bad>)", "[label](target\n\n\"title\")"]) {
+    assert.equal(inlineVisibleText(text), text);
+  }
+  const escapedNested = String.raw`[a \\[b](inner)](outer)`;
+  assert.equal(inlineVisibleText(escapedNested), escapedNested, "an escaped backslash does not escape the following bracket");
+  const code = "```\n[example](https://example.test/" + "long/".repeat(40) + ")\n```";
+  assert.ok(markdownHeight(code, 320) > markdownHeight("```\nexample\n```", 320), "fenced code remains literal");
+});
+
+test("first and adjacent headings match native heading leading without counting Markdown markers", () => {
+  const samples = [
+    ["# Heading", 36], ["## Heading", 29], ["### Heading", 24], ["#### Heading", 22],
+    ["# Heading\n\n## Heading\n\n### Heading", 116],
+    ["## One\n## Two", 70], ["## " + "見出し".repeat(20), 58],
+  ];
+  for (const [text, actual] of samples) {
+    const h = markdownHeight(text, 760);
+    assert.ok(h >= actual && h <= actual + 7, `${h} vs native ${actual}`);
+  }
+  // Preceding prose gives the heading a larger top margin than a standalone/adjacent heading.
+  assert.ok(markdownHeight("Before\n\n## Heading\n\nAfter", 760) >= 122);
+  assert.ok(markdownHeight("## Heading\n\nAfter", 760) >= 62);
+});
 
 test("line heights round like gpui's: whole px of the window, so a zoom or a text size can round them up", () => {
   assert.deepEqual([lineHeight(16), lineHeight(13), lineHeight(13.5)], [26, 21, 22], "the measured heights at zoom 1");

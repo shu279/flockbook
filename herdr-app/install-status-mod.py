@@ -11,7 +11,12 @@ import shutil
 import subprocess
 import tempfile
 
-BASE_CHAT_SHA256 = "472de392ea62d2a0509b7b233a48b4a4d3757688949cb3830c19095ec417feac"
+BASE_SHA256 = {
+    "chat.js": "472de392ea62d2a0509b7b233a48b4a4d3757688949cb3830c19095ec417feac",
+    "composer.js": "71f79aec7eb671f7937b70a047b835f6dafae08c2e6d051880604ccba1e0d929",
+    "estimate.js": "cfd222dbf59947fcfc24da56c33ed5fc45b8d72c21258552454f14695136dc26",
+}
+MODULES = (*BASE_SHA256, "chatstatus.js", "activity.js")
 
 
 def atomic_json(path, value, expected):
@@ -54,7 +59,7 @@ def main():
     destination = home / "mods" / args.name
     layout_path = home / "layouts" / (args.name + ".json")
     keys_path = home / "keys.json"
-    for required in (source / "chat.js", source / "chatstatus.js", original / "chat.js",
+    for required in (*(source / name for name in MODULES), *(original / name for name in BASE_SHA256),
                      original / "state.js", home / "layouts/flockbook.json", keys_path, home / "settings.json"):
         if not required.is_file():
             parser.error(f"required file is missing: {required}; no files changed")
@@ -62,8 +67,9 @@ def main():
     section = "layout:" + args.name
     if destination.exists() or layout_path.exists() or (home / "layouts/.state" / (args.name + ".json")).exists() or section in keys:
         parser.error("destination already exists; use a new --name instead of overwriting it")
-    if hashlib.sha256((original / "chat.js").read_bytes()).hexdigest() != BASE_CHAT_SHA256:
-        parser.error("installed chat.js differs from the supported base; review/merge it first")
+    for name, expected in BASE_SHA256.items():
+        if hashlib.sha256((original / name).read_bytes()).hexdigest() != expected:
+            parser.error(f"installed {name} differs from the supported base; review/merge it first")
     cli = shutil.which("herdr-app") or str(Path.home() / ".local/bin/herdr-app")
     env = dict(os.environ, HERDR_APP_HOME=str(home))
     before = json.loads(subprocess.check_output([cli, "status"], text=True, env=env))
@@ -77,9 +83,9 @@ def main():
     (backup / "before.json").write_text(json.dumps(before, indent=2) + "\n")
     shutil.copy2(home / "settings.json", backup / "settings.json")
     subprocess.run([cli, "do", "mod.clone", json.dumps({"name": "flockbook", "as": args.name})], check=True, env=env)
-    # Only the changed modules replace files in the clone. Original Markdown, composer,
+    # Only the changed modules replace files in the clone. Markdown rendering,
     # approval handling, helper binary/config and every user setting stay in place.
-    for filename in ("chat.js", "chatstatus.js"):
+    for filename in MODULES:
         shutil.copy2(source / filename, destination / filename)
     state = destination / "state.js"
     state.write_text(state.read_text().replace("/layouts/.state/flockbook.json", "/layouts/.state/" + args.name + ".json"))

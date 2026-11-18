@@ -43,6 +43,64 @@ const NO_START = new Set("，。、；：？！）」』】〉》〕｝％…—
 // Full-width punctuation that may not end a line: it goes down with the character after it.
 const NO_END = new Set("（「『【〈《〔｛");
 
+// Inline links draw their labels, never their destinations or optional titles. Counting a citation's
+// long URL as prose leaves hundreds of empty pixels under a source-heavy answer. Parse balanced link
+// destinations rather than using a regexp: URLs can contain parentheses, labels can contain brackets,
+// and examples inside inline code must stay literal. Malformed links are conservatively kept as text.
+export function inlineVisibleText(value) {
+  const text = String(value);
+  let out = "";
+  for (let i = 0; i < text.length;) {
+    if (text[i] === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+    if (text[i] === "`") {
+      let end = i + 1;
+      while (text[end] === "`") end++;
+      let close = -1, cursor = end;
+      while ((cursor = text.indexOf("`", cursor)) >= 0) {
+        let runEnd = cursor + 1;
+        while (text[runEnd] === "`") runEnd++;
+        if (runEnd - cursor === end - i) { close = runEnd; break; }
+        cursor = runEnd;
+      }
+      // Closing code spans need exactly the same run length. An unmatched run is literal as a
+      // whole, not a series of shorter openers that could expose a link inside a later code span.
+      if (close >= 0) { out += text.slice(i, close); i = close; continue; }
+      out += text.slice(i, end); i = end; continue;
+    }
+    if (text[i] !== "[" || (i > 0 && text[i - 1] === "!")) { out += text[i++]; continue; }
+    let labelEnd = i + 1, depth = 1, nestedLabel = false;
+    for (; labelEnd < text.length; labelEnd++) {
+      if (text[labelEnd] === "\\") { labelEnd++; continue; }
+      if (text[labelEnd] === "[") { depth++; nestedLabel = true; }
+      if (text[labelEnd] === "]" && --depth === 0) break;
+    }
+    if (labelEnd >= text.length) { out += text.slice(i); break; }
+    if (text[labelEnd + 1] !== "(") { out += text[i++]; continue; }
+    let end = labelEnd + 2, parens = 1, quoted = null, angle = false;
+    for (; end < text.length; end++) {
+      const c = text[end];
+      if (c === "\\") { end++; continue; }
+      if (quoted) { if (c === quoted) quoted = null; continue; }
+      if (angle) { if (c === ">") angle = false; continue; }
+      if (c === "<" && end === labelEnd + 2) { angle = true; continue; }
+      if ((c === '"' || c === "'") && /\s/.test(text[end - 1])) { quoted = c; continue; }
+      if (c === "(") parens++;
+      if (c === ")" && --parens === 0) break;
+    }
+    if (end >= text.length || quoted || angle) { out += text[i++]; continue; }
+    const target = text.slice(labelEnd + 2, end).trim();
+    // Whitespace is allowed only around a destination or before one quoted title.
+    const destination = !/\n\s*\n/.test(target) && /^(?:<[^<>\n]*>|(?:\\.|[^\s\\<>])*)(?:\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\((?:\\.|[^)\\])*\)))?$/.test(target);
+    if (!destination) { out += text[i++]; continue; }
+    const label = text.slice(i + 1, labelEnd);
+    // A link cannot contain another link. Leave the ambiguous outer syntax counted rather than
+    // discard a destination that the Markdown parser may actually display as ordinary text.
+    out += nestedLabel ? text.slice(i, end + 1) : label;
+    i = end + 1;
+  }
+  return out;
+}
+
 // Lines of prose drawn `width` px wide at `fs` px. gpui fills a line to its full width and lets
 // punctuation start a line (measured in the VM: 35 full-width characters fit 564 px, 36 wrap), so no
 // slack is kept: a character of slack per line counted a line too many on 5 of 54 measured paragraphs
@@ -52,7 +110,7 @@ export function proseLines(text, width, fs = FS, k = 1) {
   width = Math.max(fs, width);
   // A word: letters, digits, brackets and the marks gpui keeps inside one. A slash starts a new word:
   // gpui breaks "HC_SESSION/HC_SOCKET" before the slash (measured in the VM).
-  const units = String(text).match(/`[^`]+`|\/?[A-Za-z0-9_\-+.:@#%&=?!'"$<>~^*()[\]{}]+|\s+|./gsu) ?? [];
+  const units = inlineVisibleText(text).match(/`[^`]+`|\/?[A-Za-z0-9_\-+.:@#%&=?!'"$<>~^*()[\]{}]+|\s+|./gsu) ?? [];
   const wide = (u) => isWide(u.codePointAt(0));
   const size = (u) => u[0] === "`" && u.length > 1 ? (u.length - 2) * CODE_CH * k + CODE_PAD
     : /^\s+$/.test(u) ? fs * 0.3 * u.length
@@ -83,7 +141,7 @@ const CELL_CODE_CH = 7.1, CELL_CODE_PAD = 5;
 export function cellLines(text, width, fs = 13.5, k = 1) {
   const gs = [];
   let code = false;
-  for (const ch of String(text).replace(/\*\*/g, "")) {
+  for (const ch of inlineVisibleText(text).replace(/\*\*/g, "")) {
     if (ch === "`") { code = !code; gs.push({ ch: "", w: CELL_CODE_PAD }); continue; }
     const wide = isWide(ch.codePointAt(0));
     gs.push({ ch, wide, w: code ? CELL_CODE_CH * k : wide ? fs : ch === " " ? fs * 0.3 : latinWidth(ch, fs) });
@@ -169,15 +227,37 @@ export function markdownHeight(text, width, spans = null, k = 1, zoom = 1) {
       prevBlank = true;
       continue;
     }
-    let hard = false;  // the line before ended in a hard break: two or more spaces, or a backslash
+    let hard = false, previousLine = null; // the previous nonblank source line within this TextView
     for (const raw of b.text.split("\n")) {
       const line = raw.replace(/\t/g, "    ");
       const brk = hard;
       hard = / {2,}$|\\$/.test(raw);
       if (!line.trim()) { close(); if (!prevBlank) { h += 10; gap = 10; } prevBlank = true; continue; }
+      const leadingGap = gap, preceding = previousLine;
+      previousLine = line;
       prevBlank = false; gap = 0;
       let m;
-      if ((m = /^(#{1,6})\s/.exec(line))) { close(); lastLevel = null; const size = [30, 25, 22, 20, 17, 16][m[1].length - 1] * up; p += proseLines(line, width, size, k) * size * 1.62 + 12; continue; }
+      if ((m = /^(#{1,6})\s/.exec(line))) {
+        close(); lastLevel = null;
+        const level = m[1].length - 1, sizes = [30, 24, 20, 18, 17, 16];
+        const size = sizes[level] * up;
+        const label = line.slice(m[0].length).replace(/\s+#+\s*$/, "").replace(/\*\*/g, "");
+        const lines = proseLines(label, width, size, k);
+        const previousHeading = preceding && /^(#{1,6})\s/.exec(preceding);
+        if (preceding === null || previousHeading) {
+          // Measured native H1–H4 lines:36/29/24/22px, not body-text leading. No top margin on
+          // the first heading; adjacent headings have half the preceding font size between them.
+          const before = previousHeading ? sizes[previousHeading[1].length - 1] * up / 2 : 0;
+          h -= leadingGap;
+          p += lines * Math.ceil(size * 1.2 * zoom) / zoom + before;
+        } else {
+          // A heading after prose/list/rule has a larger top margin. Keep the existing generous
+          // allowance there: removing it as for the first heading clips mixed Markdown blocks.
+          const oldSize = [30, 25, 22, 20, 17, 16][level] * up;
+          p += lines * oldSize * 1.62 + 12;
+        }
+        continue;
+      }
       if ((m = /^(\s*)([-*+]|\d+\.)\s/.exec(line))) {
         // Text is 22 px in per level (measured). A list right under a paragraph (no blank line) still gets
         // the paragraph gap above it.
@@ -210,7 +290,7 @@ export { tableCells };
 // One line of text, in px at font size fs (markdown marks left out; leans wide like wrapLines).
 export function textWidth(text, fs = 13.5) {
   let w = 0;
-  for (const ch of String(text).replace(/\*\*|__|`/g, "")) w += isWide(ch.charCodeAt(0)) ? fs : fs * 0.58;
+  for (const ch of inlineVisibleText(text).replace(/\*\*|__|`/g, "")) w += isWide(ch.charCodeAt(0)) ? fs : fs * 0.58;
   return Math.ceil(w);
 }
 
